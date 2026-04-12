@@ -76,12 +76,6 @@ st.markdown("""
     [data-testid="stSidebar"] { background-color: #1e2a3a; }
     [data-testid="stSidebar"] * { color: #c8d6e5 !important; }
     [data-testid="stSidebar"] .stRadio label { font-size: 15px; padding: 6px 0; }
-    [data-testid="stMetric"] {
-        background-color: #f0f4f8;
-        border-radius: 8px;
-        padding: 12px 16px;
-        border-left: 4px solid #2e86de;
-    }
     .preset-active {
         background-color: #2e86de !important;
         color: white !important;
