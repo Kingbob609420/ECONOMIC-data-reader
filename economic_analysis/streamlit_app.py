@@ -352,43 +352,380 @@ def chart_correlation(df: pd.DataFrame, x_name: str, y_name: str):
     return fig, stats_dict
 
 
-# ── Auto summary ──────────────────────────────────────────────────────────────
-def build_us_summary(df: pd.DataFrame, selected: list[str], s: int, e: int) -> str:
-    lines = [f"## Economic Summary: {s}–{e}\n"]
-    lines.append(f"*{len(df)} monthly observations across {len(selected)} indicator(s)*\n")
+# ── In-depth US Summary ───────────────────────────────────────────────────────
+def render_us_summary(df: pd.DataFrame, selected: list[str], s: int, e: int):
+    """Renders a full in-depth summary directly into Streamlit."""
+    full_df = df  # already sliced to [s:e] before calling
+
+    st.markdown(f"## In-Depth US Economic Summary: {s}–{e}")
+    st.caption(f"{len(df)} monthly observations · {len(selected)} indicator(s) selected · Source: FRED")
+    st.divider()
+
+    # ── Per-indicator deep dive ───────────────────────────────────────────────
     for name in selected:
         if name not in df.columns:
             continue
         col = df[name].dropna()
-        if col.empty:
+        if len(col) < 2:
             continue
         cfg = US_INDICATORS[name]
-        trend = "rising" if col.iloc[-12:].mean() > col.iloc[-24:-12].mean() else "falling"
-        lines.append(f"### {name}")
-        lines.append(f"- **Average:** {col.mean():.2f}{cfg['unit']}")
-        lines.append(f"- **Peak:** {col.max():.2f}{cfg['unit']} ({col.idxmax().strftime('%b %Y')})")
-        lines.append(f"- **Trough:** {col.min():.2f}{cfg['unit']} ({col.idxmin().strftime('%b %Y')})")
-        lines.append(f"- **Recent trend:** {trend}")
-        lines.append(f"- **Latest reading:** {col.iloc[-1]:.2f}{cfg['unit']} ({col.index[-1].strftime('%b %Y')})\n")
-    return "\n".join(lines)
+        unit = cfg["unit"]
+
+        # Trend calculations
+        latest       = col.iloc[-1]
+        latest_dt    = col.index[-1].strftime("%B %Y")
+        prev_yr      = col.iloc[-13] if len(col) > 13 else col.iloc[0]
+        yr_change    = latest - prev_yr
+        trend_12     = col.iloc[-12:].mean()
+        trend_prev12 = col.iloc[-24:-12].mean() if len(col) >= 24 else col.iloc[:12].mean()
+        direction    = "rising" if trend_12 > trend_prev12 else "falling"
+        volatility   = col.std()
+        hist_mean    = col.mean()
+        pct_above    = (col > hist_mean).mean() * 100
+
+        # Z-score of latest reading vs period
+        z = (latest - hist_mean) / volatility if volatility > 0 else 0
+        z_label = (
+            "significantly above average" if z > 1.5 else
+            "above average" if z > 0.5 else
+            "near the period average" if abs(z) <= 0.5 else
+            "below average" if z > -1.5 else
+            "significantly below average"
+        )
+
+        # Momentum: last 3 months vs prior 3
+        mom = col.iloc[-3:].mean() - col.iloc[-6:-3].mean() if len(col) >= 6 else 0
+        mom_label = "accelerating" if mom > 0.1 else "decelerating" if mom < -0.1 else "stable"
+
+        with st.expander(f"**{name}**  —  Latest: {latest:.2f}{unit}  |  Trend: {direction.upper()}", expanded=True):
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("Latest",   f"{latest:.2f}{unit}",   f"{yr_change:+.2f}{unit} vs yr ago")
+            c2.metric("Average",  f"{hist_mean:.2f}{unit}")
+            c3.metric("Peak",     f"{col.max():.2f}{unit}", col.idxmax().strftime("%b %Y"))
+            c4.metric("Trough",   f"{col.min():.2f}{unit}", col.idxmin().strftime("%b %Y"))
+
+            st.markdown(f"""
+**What the numbers say:**
+
+The **{name}** averaged **{hist_mean:.2f}{unit}** over the {s}–{e} period,
+with a standard deviation of **{volatility:.2f}{unit}** — indicating
+{"high" if volatility > hist_mean * 0.3 else "moderate" if volatility > hist_mean * 0.1 else "low"} volatility.
+The most recent reading of **{latest:.2f}{unit}** ({latest_dt}) is {z_label}
+(z-score: {z:+.2f}).
+
+**Trend:** The indicator is currently **{direction}** — the 12-month average
+({trend_12:.2f}{unit}) is {"above" if trend_12 > trend_prev12 else "below"} the
+prior 12-month average ({trend_prev12:.2f}{unit}).
+Short-term momentum is **{mom_label}** (3-month change: {mom:+.2f}{unit}).
+
+**Historical context:** {pct_above:.0f}% of monthly readings in this period were
+above the period average. The range from trough to peak spans
+**{col.max() - col.min():.2f}{unit}**, suggesting
+{"a very volatile period" if col.max() - col.min() > hist_mean * 1.5 else "a relatively stable period"}.
+""")
+
+            # Indicator-specific context
+            if name == "Inflation (CPI YoY %)":
+                gap = latest - 2.0
+                st.info(f"**Fed target gap:** Inflation is currently **{abs(gap):.1f}pp {'above' if gap > 0 else 'below'}** the 2% target. "
+                        f"{'The Fed is likely in tightening mode.' if gap > 1 else 'The Fed may be considering cuts.' if gap < -0.5 else 'Inflation is near target — neutral stance likely.'}")
+            elif name == "Unemployment Rate (%)":
+                nairu = 4.5  # rough NAIRU estimate
+                st.info(f"**Labor market:** Unemployment is {'below' if latest < nairu else 'above'} the estimated natural rate (~4.5%). "
+                        f"{'A tight labor market — workers have bargaining power, wages tend to rise.' if latest < nairu else 'Slack in the labor market — workers have less leverage, wage growth subdued.'}")
+            elif name == "Fed Funds Rate (%)":
+                st.info(f"**Policy stance:** A rate of {latest:.2f}% is considered "
+                        f"{'highly restrictive — designed to slow the economy and cool inflation.' if latest > 4 else 'moderately restrictive.' if latest > 2 else 'accommodative — designed to stimulate growth.' if latest < 1 else 'roughly neutral.'}")
+            elif name == "Real GDP Growth (%)":
+                st.info(f"**Growth assessment:** {latest:.1f}% growth is "
+                        f"{'contraction — the economy is shrinking.' if latest < 0 else 'below trend — slow recovery or stagnation.' if latest < 1.5 else 'near potential — steady expansion.' if latest < 3 else 'above trend — strong growth, may raise inflation concerns.'}")
+            elif name == "10-Year Treasury Rate (%)":
+                st.info(f"**Yield signal:** The 10-year at {latest:.2f}% reflects market expectations for long-run growth and inflation. "
+                        f"{'High by recent standards — markets expect persistent inflation or tighter policy.' if latest > 4 else 'Low — markets expect slow growth or loose policy ahead.'}")
+
+    st.divider()
+
+    # ── Cross-indicator analysis ──────────────────────────────────────────────
+    st.markdown("### Cross-Indicator Analysis")
+
+    has_infl  = "Inflation (CPI YoY %)"    in selected and "Inflation (CPI YoY %)"    in df.columns
+    has_unemp = "Unemployment Rate (%)"     in selected and "Unemployment Rate (%)"     in df.columns
+    has_fed   = "Fed Funds Rate (%)"        in selected and "Fed Funds Rate (%)"        in df.columns
+    has_gdp   = "Real GDP Growth (%)"       in selected and "Real GDP Growth (%)"       in df.columns
+    has_wages = "Avg Hourly Earnings (YoY %)" in selected and "Avg Hourly Earnings (YoY %)" in df.columns
+
+    if has_infl and has_unemp:
+        r_pc = df["Inflation (CPI YoY %)"].corr(df["Unemployment Rate (%)"])
+        pc_label = (
+            "strongly holds — low unemployment is clearly associated with higher inflation"   if r_pc < -0.5 else
+            "moderately holds — some inverse relationship present"                            if r_pc < -0.2 else
+            "weak or absent — supply-side forces may be dominating"                           if abs(r_pc) < 0.2 else
+            "reversed — both rising or falling together (stagflation or disinflation dynamics)"
+        )
+        st.markdown(f"""
+**Phillips Curve (Inflation vs. Unemployment):** r = **{r_pc:+.3f}**
+
+The trade-off {pc_label}. {"A negative correlation is the textbook expectation — tight labor markets give workers wage bargaining power, pushing up prices." if r_pc < 0 else "A positive correlation is unusual and typically signals an external shock (e.g. oil embargo, pandemic supply disruption) is driving both indicators simultaneously."}
+""")
+
+    if has_infl and has_fed:
+        r_fi = df["Fed Funds Rate (%)"].corr(df["Inflation (CPI YoY %)"])
+        st.markdown(f"""
+**Fed Policy vs. Inflation:** r = **{r_fi:+.3f}**
+
+{"The Fed has been raising rates alongside rising inflation — reactive but expected policy." if r_fi > 0.3 else "Weak or negative correlation — the Fed may have been cutting rates despite inflation, or the two moved independently."}
+The Fed typically targets a 'real rate' (Fed Funds Rate minus Inflation) above zero to be restrictive. Currently: **{df["Fed Funds Rate (%)"].iloc[-1] - df["Inflation (CPI YoY %)"].iloc[-1]:.2f}pp** real rate.
+""")
+
+    if has_gdp and has_unemp:
+        r_gu = df["Real GDP Growth (%)"].corr(df["Unemployment Rate (%)"])
+        st.markdown(f"""
+**Okun's Law (GDP Growth vs. Unemployment):** r = **{r_gu:+.3f}**
+
+{"Strong inverse relationship — GDP growth is reducing unemployment as expected (Okun's Law holding)." if r_gu < -0.3 else "Weaker than expected — growth may be happening without proportionate job creation ('jobless recovery' pattern)."}
+""")
+
+    if has_wages and has_infl:
+        r_wi = df["Avg Hourly Earnings (YoY %)"].corr(df["Inflation (CPI YoY %)"])
+        st.markdown(f"""
+**Wage-Price Spiral Risk:** r = **{r_wi:+.3f}**
+
+{"Wages and inflation are moving together — a wage-price spiral risk where higher wages fuel higher prices which demand higher wages." if r_wi > 0.4 else "Wages and inflation are not strongly correlated in this period — workers may be losing real purchasing power if inflation is outpacing wages."}
+""")
+
+    if not any([has_infl and has_unemp, has_infl and has_fed, has_gdp and has_unemp]):
+        st.info("Select more indicators (e.g. Inflation + Unemployment + Fed Funds Rate) to unlock cross-indicator analysis.")
+
+    st.divider()
+
+    # ── Period verdict ────────────────────────────────────────────────────────
+    st.markdown("### Overall Period Assessment")
+    verdicts = []
+    if has_infl:
+        avg_i = df["Inflation (CPI YoY %)"].mean()
+        verdicts.append(f"**Inflation:** {'High-inflation period' if avg_i > 5 else 'Moderate-inflation period' if avg_i > 3 else 'Low-inflation period' if avg_i > 1 else 'Deflationary risk period'} (avg {avg_i:.1f}%)")
+    if has_unemp:
+        avg_u = df["Unemployment Rate (%)"].mean()
+        verdicts.append(f"**Labor Market:** {'Tight — strong employment' if avg_u < 5 else 'Moderate — near full employment' if avg_u < 6.5 else 'Weak — elevated unemployment'} (avg {avg_u:.1f}%)")
+    if has_gdp:
+        avg_g = df["Real GDP Growth (%)"].mean()
+        verdicts.append(f"**Growth:** {'Expansion — above trend growth' if avg_g > 2.5 else 'Moderate growth' if avg_g > 1 else 'Near stagnation or contraction'} (avg {avg_g:.1f}%)")
+    if has_fed:
+        avg_f = df["Fed Funds Rate (%)"].mean()
+        verdicts.append(f"**Monetary Policy:** {'Restrictive — high rates' if avg_f > 4 else 'Neutral — moderate rates' if avg_f > 1.5 else 'Accommodative — low rates'} (avg {avg_f:.1f}%)")
+
+    for v in verdicts:
+        st.markdown(f"- {v}")
+
+    if has_infl and has_unemp:
+        avg_i = df["Inflation (CPI YoY %)"].mean()
+        avg_u = df["Unemployment Rate (%)"].mean()
+        if avg_i < 4 and avg_u < 5.5:
+            st.success(f"**Period Verdict:** This was a **Goldilocks period** — both inflation and unemployment were relatively low and stable. Ideal macroeconomic conditions.")
+        elif avg_i > 5 and avg_u > 6:
+            st.error(f"**Period Verdict:** This period showed **stagflation characteristics** — high inflation combined with high unemployment. The worst-case scenario for policymakers.")
+        elif avg_i > 5:
+            st.warning(f"**Period Verdict:** This was a **high-inflation period**. Price stability was the dominant policy challenge.")
+        elif avg_u > 7:
+            st.warning(f"**Period Verdict:** This was a **high-unemployment period**. Labor market weakness was the dominant concern.")
+        else:
+            st.info(f"**Period Verdict:** Mixed conditions — some indicators elevated, others stable. A period of transition or policy adjustment.")
 
 
-def build_global_summary(wb_df: pd.DataFrame, indicator: str, s: int, e: int) -> str:
+# ── In-depth Global Summary ───────────────────────────────────────────────────
+def render_global_summary(wb_df: pd.DataFrame, indicator: str, s: int, e: int, selected_countries: list[str]):
     sub = wb_df.loc[s:e].dropna(how="all")
     if sub.empty:
-        return "No data available."
-    latest_year = sub.dropna(how="all").index[-1]
-    latest = sub.loc[latest_year].dropna().sort_values()
-    lines = [f"## Global Summary: {indicator} ({s}–{e})\n"]
-    lines.append(f"**Latest available year: {latest_year}**\n")
-    if not latest.empty:
-        lines.append(f"- Lowest:  **{latest.index[0]}** at {latest.iloc[0]:.2f}")
-        lines.append(f"- Highest: **{latest.index[-1]}** at {latest.iloc[-1]:.2f}")
-        lines.append(f"- Average across selected countries: {latest.mean():.2f}\n")
-    lines.append("### Country-by-country (latest year)\n")
-    for country, val in latest.sort_values(ascending=False).items():
-        lines.append(f"- **{country}:** {val:.2f}")
-    return "\n".join(lines)
+        st.warning("No data available for this selection.")
+        return
+
+    latest_year  = sub.dropna(how="all").index[-1]
+    earliest_year = sub.dropna(how="all").index[0]
+    latest_row   = sub.loc[latest_year].dropna()
+    available    = [c for c in selected_countries if c in sub.columns]
+
+    st.markdown(f"## In-Depth Global Summary: {indicator}")
+    st.caption(f"Countries: {', '.join(available)} · Period: {earliest_year}–{latest_year} · Source: World Bank")
+    st.divider()
+
+    # ── Global snapshot ───────────────────────────────────────────────────────
+    st.markdown(f"### Snapshot: {latest_year}")
+    if not latest_row.empty:
+        ranked     = latest_row.sort_values(ascending=False)
+        global_avg = latest_row.mean()
+        spread     = latest_row.max() - latest_row.min()
+
+        snap_c1, snap_c2, snap_c3, snap_c4 = st.columns(4)
+        snap_c1.metric("Group Average",  f"{global_avg:.2f}")
+        snap_c2.metric("Highest",  f"{ranked.index[0]}", f"{ranked.iloc[0]:.2f}")
+        snap_c3.metric("Lowest",   f"{ranked.index[-1]}", f"{ranked.iloc[-1]:.2f}")
+        snap_c4.metric("Spread (High–Low)", f"{spread:.2f}")
+
+        st.markdown(f"""
+In **{latest_year}**, the average **{indicator}** across selected countries was **{global_avg:.2f}**.
+The gap between the highest (**{ranked.index[0]}** at {ranked.iloc[0]:.2f}) and lowest
+(**{ranked.index[-1]}** at {ranked.iloc[-1]:.2f}) was **{spread:.2f}** — indicating
+{"extreme divergence between economies" if spread > global_avg * 2 else "significant but manageable variation" if spread > global_avg else "relatively convergent performance across countries"}.
+""")
+
+    st.divider()
+
+    # ── Per-country deep dive ─────────────────────────────────────────────────
+    st.markdown("### Country-by-Country Analysis")
+    for country in available:
+        col_data = sub[country].dropna()
+        if len(col_data) < 2:
+            continue
+
+        latest_val   = col_data.iloc[-1]
+        latest_yr    = col_data.index[-1]
+        earliest_val = col_data.iloc[0]
+        earliest_yr  = col_data.index[0]
+        avg_val      = col_data.mean()
+        peak_val     = col_data.max()
+        peak_yr      = col_data.idxmax()
+        trough_val   = col_data.min()
+        trough_yr    = col_data.idxmin()
+        total_change = latest_val - earliest_val
+        volatility   = col_data.std()
+
+        # Trend over last 5 years
+        recent = col_data.iloc[-5:] if len(col_data) >= 5 else col_data
+        prior  = col_data.iloc[-10:-5] if len(col_data) >= 10 else col_data
+        trend  = "improving" if recent.mean() < prior.mean() else "worsening"
+        # For GDP Growth / GDP per capita, higher = better; invert for inflation/unemployment
+        if "GDP" in indicator:
+            trend = "improving" if recent.mean() > prior.mean() else "worsening"
+
+        # Rank in latest year
+        if not latest_row.empty and country in latest_row.index:
+            rank_asc  = int((latest_row < latest_val).sum()) + 1
+            rank_desc = int((latest_row > latest_val).sum()) + 1
+            n_countries = len(latest_row)
+            rank_label = f"#{rank_desc} highest of {n_countries}" if "GDP" in indicator else f"#{rank_asc} lowest of {n_countries}"
+        else:
+            rank_label = "N/A"
+
+        with st.expander(f"**{country}** — {latest_yr}: {latest_val:.2f}  |  Trend: {trend.upper()}", expanded=False):
+            cc1, cc2, cc3, cc4 = st.columns(4)
+            cc1.metric("Latest",  f"{latest_val:.2f}",  f"({latest_yr})")
+            cc2.metric("Average", f"{avg_val:.2f}")
+            cc3.metric("Peak",    f"{peak_val:.2f}",    f"({peak_yr})")
+            cc4.metric("Trough",  f"{trough_val:.2f}",  f"({trough_yr})")
+
+            st.markdown(f"""
+**{country}** recorded a **{indicator}** of **{latest_val:.2f}** in {latest_yr},
+ranking **{rank_label}** among selected countries.
+
+Over the {earliest_yr}–{latest_yr} period, the indicator averaged **{avg_val:.2f}**
+with a standard deviation of **{volatility:.2f}** —
+{"highly volatile" if volatility > avg_val * 0.5 else "moderately volatile" if volatility > avg_val * 0.2 else "relatively stable"}.
+The total change from {earliest_yr} to {latest_yr} was **{total_change:+.2f}**
+({"improving" if (total_change < 0 and "Inflation" in indicator) or (total_change < 0 and "Unemployment" in indicator) or (total_change > 0 and "GDP" in indicator) else "worsening"} direction).
+
+The peak of **{peak_val:.2f}** occurred in **{peak_yr}**
+and the trough of **{trough_val:.2f}** in **{trough_yr}**.
+Recent 5-year trend is **{trend}** compared to the prior 5-year period.
+""")
+
+            # Country-specific context callouts
+            if indicator == "Inflation (annual %)":
+                if latest_val > 20:
+                    st.error(f"**Crisis-level inflation.** At {latest_val:.1f}%, {country} is experiencing hyperinflationary or near-hyperinflationary conditions. This destroys purchasing power rapidly and typically signals deep fiscal or monetary problems.")
+                elif latest_val > 8:
+                    st.warning(f"**High inflation.** {latest_val:.1f}% is well above the typical 2% target for developed economies. Central bank is likely under significant pressure to tighten.")
+                elif latest_val < 0:
+                    st.warning(f"**Deflation.** Negative inflation sounds good but is dangerous — it encourages people to delay purchases expecting lower prices, which slows the economy.")
+                else:
+                    st.success(f"**Stable inflation.** {latest_val:.1f}% is within a broadly healthy range.")
+
+            elif indicator == "Unemployment (% labor force)":
+                if latest_val > 15:
+                    st.error(f"**Severe unemployment.** At {latest_val:.1f}%, {country} faces a serious structural labor market challenge with major social and economic consequences.")
+                elif latest_val > 8:
+                    st.warning(f"**Elevated unemployment.** {latest_val:.1f}% suggests significant slack in the labor market. Growth is not translating into enough jobs.")
+                elif latest_val < 4:
+                    st.success(f"**Near full employment.** {latest_val:.1f}% is historically very low. Workers have strong bargaining power; wage growth likely.")
+                else:
+                    st.info(f"**Moderate unemployment.** {latest_val:.1f}% is near the typical range for developed economies.")
+
+            elif indicator == "GDP Growth (annual %)":
+                if latest_val < 0:
+                    st.error(f"**Recession.** Negative GDP growth ({latest_val:.1f}%) means the economy is contracting — output, incomes, and employment are all declining.")
+                elif latest_val < 1:
+                    st.warning(f"**Near stagnation.** {latest_val:.1f}% is barely growing — not enough to absorb new workers or raise living standards.")
+                elif latest_val > 6:
+                    st.success(f"**Rapid expansion.** {latest_val:.1f}% growth is very strong — typically seen in emerging markets catching up, or post-recession rebounds.")
+                else:
+                    st.info(f"**Steady growth.** {latest_val:.1f}% is within the normal healthy range for an established economy.")
+
+            elif indicator == "GDP per Capita (USD)":
+                if latest_val > 50000:
+                    st.success(f"**High-income economy.** ${latest_val:,.0f} per capita places {country} among the wealthiest nations.")
+                elif latest_val > 15000:
+                    st.info(f"**Upper-middle-income economy.** ${latest_val:,.0f} per capita — significant development achieved but gap remains vs. top economies.")
+                elif latest_val > 4000:
+                    st.warning(f"**Lower-middle-income economy.** ${latest_val:,.0f} per capita — large share of population still in poverty by global standards.")
+                else:
+                    st.error(f"**Low-income economy.** ${latest_val:,.0f} per capita — significant development challenges.")
+
+    st.divider()
+
+    # ── Comparative trends ────────────────────────────────────────────────────
+    st.markdown("### Comparative Trends Across Countries")
+
+    if len(available) >= 2:
+        # Fastest improver / deteriorator
+        changes = {}
+        for country in available:
+            col_data = sub[country].dropna()
+            if len(col_data) >= 2:
+                changes[country] = col_data.iloc[-1] - col_data.iloc[0]
+
+        if changes:
+            best_country = min(changes, key=changes.get) if "Inflation" in indicator or "Unemployment" in indicator else max(changes, key=changes.get)
+            worst_country = max(changes, key=changes.get) if "Inflation" in indicator or "Unemployment" in indicator else min(changes, key=changes.get)
+            st.markdown(f"""
+**Biggest improvement** over {earliest_year}–{latest_year}: **{best_country}**
+(change: {changes[best_country]:+.2f})
+
+**Biggest deterioration** over {earliest_year}–{latest_year}: **{worst_country}**
+(change: {changes[worst_country]:+.2f})
+""")
+
+        # Convergence / divergence
+        early_std = sub.loc[earliest_year:earliest_year+4].std(axis=1).mean() if len(sub) > 5 else None
+        recent_std = sub.iloc[-5:].std(axis=1).mean()
+        if early_std is not None:
+            if recent_std < early_std * 0.8:
+                st.info(f"**Convergence:** Countries have become MORE similar over time (spread narrowed from ~{early_std:.2f} to ~{recent_std:.2f}). This suggests shared global forces or policy coordination.")
+            elif recent_std > early_std * 1.2:
+                st.warning(f"**Divergence:** Countries have become MORE different over time (spread widened from ~{early_std:.2f} to ~{recent_std:.2f}). Different policy choices or structural factors are pulling economies apart.")
+            else:
+                st.info(f"**Stable spread:** The variation between countries has remained broadly consistent (~{recent_std:.2f}).")
+
+    st.divider()
+
+    # ── Overall verdict ───────────────────────────────────────────────────────
+    st.markdown("### Overall Period Assessment")
+    if not latest_row.empty:
+        avg = latest_row.mean()
+        high_performers = [c for c in latest_row.index if (
+            (latest_row[c] < avg and ("Inflation" in indicator or "Unemployment" in indicator)) or
+            (latest_row[c] > avg and "GDP" in indicator)
+        )]
+        low_performers = [c for c in latest_row.index if c not in high_performers]
+
+        if high_performers:
+            st.success(f"**Outperforming in {latest_year}:** {', '.join(high_performers)}")
+        if low_performers:
+            st.warning(f"**Underperforming in {latest_year}:** {', '.join(low_performers)}")
+
+        st.markdown(f"""
+The **{indicator}** data for {s}–{e} reveals {"significant" if latest_row.std() > latest_row.mean() * 0.5 else "moderate"} variation
+across selected countries. With a group average of **{avg:.2f}** in {latest_year}, the data
+shows that economic outcomes are {"highly divergent — country-specific factors dominate" if latest_row.std() > latest_row.mean() * 0.5 else "broadly aligned — global forces are the dominant driver"}.
+""")
 
 
 # ── Sidebar ───────────────────────────────────────────────────────────────────
@@ -559,29 +896,7 @@ if mode == "🇺🇸 US Economy":
                         cmap="RdYlGn", vmin=-1, vmax=1), use_container_width=True)
 
     with tab_summary:
-        st.markdown(build_us_summary(df, selected_indicators, s, e))
-
-        # Key insights box
-        st.divider()
-        st.markdown("### How to interpret this data")
-        if "Inflation (CPI YoY %)" in selected_indicators and "Unemployment Rate (%)" in selected_indicators:
-            r_val = df["Inflation (CPI YoY %)"].corr(df["Unemployment Rate (%)"])
-            direction = "inverse (Phillips Curve holds)" if r_val < -0.1 \
-                else "positive (stagflation dynamics)" if r_val > 0.1 \
-                else "no clear relationship"
-            st.info(f"""**Phillips Curve check for {s}–{e}:**
-Inflation vs. Unemployment correlation = **{r_val:+.3f}** → {direction}
-
-The classic Phillips Curve predicts a negative correlation (when unemployment is low, inflation rises).
-A positive correlation suggests supply shocks are overriding normal demand-side dynamics.""")
-
-        if "Fed Funds Rate (%)" in selected_indicators and "Inflation (CPI YoY %)" in selected_indicators:
-            r_val2 = df["Fed Funds Rate (%)"].corr(df["Inflation (CPI YoY %)"])
-            st.info(f"""**Fed policy check for {s}–{e}:**
-Fed Funds Rate vs. Inflation correlation = **{r_val2:+.3f}**
-
-A positive correlation means the Fed raised rates when inflation rose (reactive policy).
-A negative correlation would suggest the Fed was ahead of the curve.""")
+        render_us_summary(df, selected_indicators, s, e)
 
 
 # ════════════════════════════════════════
@@ -666,13 +981,4 @@ else:
         )
 
     with tab_summary:
-        st.markdown(build_global_summary(wb_df, global_indicator, s, e))
-
-        # Rankings table
-        if not latest_row.empty:
-            st.markdown(f"### Country Rankings ({latest_year})")
-            rank_df = latest_row.sort_values(ascending=False).reset_index()
-            rank_df.columns = ["Country", global_indicator]
-            rank_df.insert(0, "Rank", range(1, len(rank_df)+1))
-            rank_df[global_indicator] = rank_df[global_indicator].round(2)
-            st.dataframe(rank_df, hide_index=True, use_container_width=True)
+        render_global_summary(wb_df, global_indicator, s, e, selected_countries)
