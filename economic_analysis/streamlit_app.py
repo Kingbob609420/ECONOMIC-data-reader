@@ -61,6 +61,16 @@ COUNTRIES = {
     "Indonesia": "ID",     "Turkey": "TR",
 }
 
+# World Bank returns different names for some countries — map them back
+WB_NAME_FIX = {
+    "Korea, Rep.": "South Korea",
+    "Turkiye":     "Turkey",
+    "Iran, Islamic Rep.": "Iran",
+    "Egypt, Arab Rep.": "Egypt",
+    "Russian Federation": "Russia",
+    "Venezuela, RB": "Venezuela",
+}
+
 COUNTRY_COLORS = [
     "#1f77b4","#d62728","#2ca02c","#ff7f0e","#9467bd",
     "#8c564b","#e377c2","#7f7f7f","#bcbd22","#17becf",
@@ -120,29 +130,43 @@ def fetch_fred(symbol: str) -> pd.Series:
 @st.cache_data(show_spinner=False)
 def fetch_worldbank(indicator_code: str, country_codes: tuple) -> pd.DataFrame:
     codes = ";".join(country_codes)
-    url = (
-        f"https://api.worldbank.org/v2/country/{codes}/indicator/{indicator_code}"
-        f"?format=json&date=1960:2025&per_page=5000"
-    )
-    try:
-        resp = requests.get(url, timeout=60)
-        resp.raise_for_status()
-        data = resp.json()
-    except Exception:
-        return pd.DataFrame()
-    if len(data) < 2 or not data[1]:
-        return pd.DataFrame()
     rows = []
-    for item in data[1]:
-        if item.get("value") is not None:
-            rows.append({
-                "country": item["country"]["value"],
-                "year":    int(item["date"]),
-                "value":   float(item["value"]),
-            })
+    page = 1
+    while True:
+        url = (
+            f"https://api.worldbank.org/v2/country/{codes}/indicator/{indicator_code}"
+            f"?format=json&date=1960:2025&per_page=1000&page={page}"
+        )
+        for attempt in range(3):
+            try:
+                resp = requests.get(url, timeout=90)
+                resp.raise_for_status()
+                data = resp.json()
+                break
+            except Exception as exc:
+                if attempt == 2:
+                    raise RuntimeError(
+                        f"World Bank API failed after 3 attempts: {exc}"
+                    ) from exc
+        if len(data) < 2 or not data[1]:
+            break
+        for item in data[1]:
+            if item.get("value") is not None:
+                raw_name = item["country"]["value"]
+                country  = WB_NAME_FIX.get(raw_name, raw_name)
+                rows.append({
+                    "country": country,
+                    "year":    int(item["date"]),
+                    "value":   float(item["value"]),
+                })
+        total_pages = data[0].get("pages", 1)
+        if page >= total_pages:
+            break
+        page += 1
+
+    if not rows:
+        return pd.DataFrame()
     df = pd.DataFrame(rows)
-    if df.empty:
-        return df
     return df.pivot(index="year", columns="country", values="value").sort_index()
 
 
@@ -572,11 +596,15 @@ else:
 
     country_codes = tuple(COUNTRIES[c] for c in selected_countries if c in COUNTRIES)
 
-    with st.spinner("Loading World Bank data..."):
-        wb_df = fetch_worldbank(GLOBAL_INDICATORS[global_indicator], country_codes)
+    with st.spinner("Loading World Bank data... (may take a few seconds)"):
+        try:
+            wb_df = fetch_worldbank(GLOBAL_INDICATORS[global_indicator], country_codes)
+        except RuntimeError as exc:
+            st.error(f"**Could not reach World Bank API.** Check your internet connection and try again.\n\n`{exc}`")
+            st.stop()
 
     if wb_df.empty:
-        st.error("No data returned from World Bank API. Try a different indicator or country selection.")
+        st.warning("World Bank returned no data for this combination. Try selecting fewer countries or a different indicator.")
         st.stop()
 
     # Rename columns to full country names
