@@ -728,6 +728,257 @@ shows that economic outcomes are {"highly divergent — country-specific factors
 """)
 
 
+# ── Forecasting ──────────────────────────────────────────────────────────────
+def chart_forecast(col: pd.Series, name: str, months_ahead: int = 60):
+    """Linear trend + 12-month MA projected forward with 95% CI band."""
+    if len(col) < 24:
+        return None, None
+
+    cfg  = US_INDICATORS[name]
+    unit = cfg["unit"]
+
+    x     = np.arange(len(col))
+    y     = col.values
+    slope, intercept, r, _, _ = stats.linregress(x, y)
+
+    # Residual RMSE for confidence interval
+    rmse   = np.sqrt(np.mean((y - (slope * x + intercept)) ** 2))
+    x_mean = x.mean()
+    ss_x   = np.sum((x - x_mean) ** 2)
+
+    # Future projection
+    fx     = np.arange(len(col), len(col) + months_ahead)
+    fdates = pd.date_range(col.index[-1] + pd.DateOffset(months=1),
+                           periods=months_ahead, freq="MS")
+    fvals  = slope * fx + intercept
+    ci     = 1.96 * rmse * np.sqrt(1 + 1 / len(col) + (fx - x_mean) ** 2 / ss_x)
+
+    # 12-month moving average
+    ma = col.rolling(12).mean()
+
+    fig, ax = plt.subplots(figsize=(13, 5))
+    fig.patch.set_facecolor("white")
+    ax.set_facecolor("#fafafa")
+
+    ax.plot(col.index, col,  color=cfg["color"], lw=1.4, alpha=0.5, label="Actual")
+    ax.plot(ma.index,  ma,   color=cfg["color"], lw=2.2, label="12-month Moving Average")
+    ax.plot(col.index, slope * x + intercept,
+            color="black", lw=1, ls="--", alpha=0.4, label="Historical trend")
+    ax.plot(fdates, fvals, color="black", lw=2,   ls="--", label="Forecast")
+    ax.fill_between(fdates, fvals - ci, fvals + ci,
+                    color="gray", alpha=0.18, label="95% Confidence Interval")
+    ax.axvline(col.index[-1], color="#aaa", lw=1, ls=":")
+
+    ax.set_title(f"{name}  —  5-Year Forecast", fontsize=12, fontweight="bold")
+    ax.set_ylabel(f"({unit})")
+    ax.legend(fontsize=8, framealpha=0.95)
+    ax.grid(axis="y", alpha=0.3, ls="--")
+    fig.tight_layout()
+
+    info = {
+        "current":      col.iloc[-1],
+        "current_date": col.index[-1].strftime("%B %Y"),
+        "forecast_val": fvals[-1],
+        "target_year":  fdates[-1].year,
+        "direction":    "rise" if slope > 0 else "fall",
+        "annual_change": slope * 12,
+        "r_squared":    r ** 2,
+        "unit":         unit,
+        "ci_end":       ci[-1],
+    }
+    return fig, info
+
+
+# ── Period Comparison ─────────────────────────────────────────────────────────
+def render_period_comparison(df: pd.DataFrame, selected: list):
+    st.markdown("### Period vs Period Comparison")
+    st.caption("Compare average economic conditions across any two time windows.")
+
+    min_yr = int(df.index.year.min())
+    max_yr = int(df.index.year.max())
+    mid    = (min_yr + max_yr) // 2
+
+    col1, col2 = st.columns(2)
+    with col1:
+        st.markdown("**Period A**")
+        pa_s = st.number_input("Start", min_value=min_yr, max_value=max_yr - 1,
+                               value=min_yr, key="pa_s")
+        pa_e = st.number_input("End",   min_value=min_yr + 1, max_value=max_yr,
+                               value=mid,    key="pa_e")
+    with col2:
+        st.markdown("**Period B**")
+        pb_s = st.number_input("Start", min_value=min_yr, max_value=max_yr - 1,
+                               value=mid + 1, key="pb_s")
+        pb_e = st.number_input("End",   min_value=min_yr + 1, max_value=max_yr,
+                               value=max_yr,  key="pb_e")
+
+    df_a = df[str(pa_s):str(pa_e)]
+    df_b = df[str(pb_s):str(pb_e)]
+
+    rows = []
+    findings = []
+    for name in selected:
+        if name not in df.columns:
+            continue
+        a = df_a[name].dropna()
+        b = df_b[name].dropna()
+        if a.empty or b.empty:
+            continue
+        cfg  = US_INDICATORS[name]
+        unit = cfg["unit"]
+        short = name.split("(")[0].strip()
+
+        # Lower = better for inflation/unemployment; higher = better for rest
+        lower_is_better = name in ("Inflation (CPI YoY %)", "Core Inflation (YoY %)",
+                                   "Unemployment Rate (%)")
+        better = "A" if (a.mean() < b.mean()) == lower_is_better else "B"
+        change = b.mean() - a.mean()
+        improved = (change < 0) == lower_is_better
+
+        rows.append({
+            "Indicator":                  short,
+            f"Period A  ({pa_s}–{pa_e})": f"{a.mean():.2f}{unit}",
+            f"Period B  ({pb_s}–{pb_e})": f"{b.mean():.2f}{unit}",
+            "Change A→B":                 f"{change:+.2f}{unit}",
+            "Better Period":              f"Period {better}",
+        })
+        verb = "improved" if improved else "worsened"
+        findings.append(
+            f"- **{short}** {verb} in Period B — "
+            f"average went from {a.mean():.2f}{unit} to {b.mean():.2f}{unit} "
+            f"({change:+.2f}{unit})"
+        )
+
+    if rows:
+        st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
+        st.markdown("**Auto-Generated Findings:**")
+        for f in findings:
+            st.markdown(f)
+
+        # Overall verdict
+        a_wins = sum(1 for r in rows if r["Better Period"] == "Period A")
+        b_wins = sum(1 for r in rows if r["Better Period"] == "Period B")
+        if a_wins > b_wins:
+            st.success(f"**Overall: Period A ({pa_s}–{pa_e}) was stronger** across {a_wins}/{len(rows)} indicators.")
+        elif b_wins > a_wins:
+            st.success(f"**Overall: Period B ({pb_s}–{pb_e}) was stronger** across {b_wins}/{len(rows)} indicators.")
+        else:
+            st.info("**Overall: Mixed results** — each period outperformed the other on different indicators.")
+    else:
+        st.info("Select at least one indicator and ensure both periods have data.")
+
+
+# ── Composite Scorecard (Global) ──────────────────────────────────────────────
+@st.cache_data(show_spinner=False)
+def fetch_all_wb(country_codes: tuple) -> dict:
+    """Fetch all 4 World Bank indicators for the scorecard."""
+    results = {}
+    for ind_name, ind_code in GLOBAL_INDICATORS.items():
+        try:
+            df = fetch_worldbank(ind_code, country_codes)
+            if not df.empty:
+                results[ind_name] = df
+        except Exception:
+            pass
+    return results
+
+
+def render_scorecard(all_data: dict, selected_countries: list, ref_year: int):
+    st.markdown("### Economy Scorecard")
+    st.caption(
+        "Composite ranking across Inflation, Unemployment, GDP Growth, and GDP per Capita. "
+        "Score 0–100 per indicator (higher = better). Normalized within the selected country group."
+    )
+
+    if not all_data:
+        st.warning("No scorecard data could be loaded.")
+        return
+
+    LOWER_BETTER = {"Inflation (annual %)", "Unemployment (% labor force)"}
+    scores: dict[str, dict] = {c: {} for c in selected_countries}
+
+    for ind_name, wb_df in all_data.items():
+        avail = wb_df.dropna(how="all").index
+        if len(avail) == 0:
+            continue
+        yr = min(avail, key=lambda y: abs(y - ref_year))
+        row = wb_df.loc[yr].dropna()
+        if len(row) < 2:
+            continue
+
+        lo, hi = row.min(), row.max()
+        if hi == lo:
+            continue
+
+        for country in selected_countries:
+            if country not in row.index:
+                continue
+            norm = (row[country] - lo) / (hi - lo) * 100
+            scores[country][ind_name] = (100 - norm) if ind_name in LOWER_BETTER else norm
+
+    rows = []
+    for country in selected_countries:
+        if not scores[country]:
+            continue
+        vals    = list(scores[country].values())
+        comp    = round(np.mean(vals), 1)
+        grade   = "A+" if comp >= 85 else "A" if comp >= 75 else "B" if comp >= 55 else "C" if comp >= 35 else "D"
+        r = {"Rank": 0, "Country": country, "Score": comp, "Grade": grade}
+        for ind_name in GLOBAL_INDICATORS:
+            short = ind_name.split("(")[0].strip()
+            r[short] = round(scores[country].get(ind_name, np.nan), 1)
+        rows.append(r)
+
+    if not rows:
+        st.warning("Not enough data to build scorecard. Try different countries or year.")
+        return
+
+    sc_df = (pd.DataFrame(rows)
+               .sort_values("Score", ascending=False)
+               .reset_index(drop=True))
+    sc_df["Rank"] = range(1, len(sc_df) + 1)
+
+    st.dataframe(
+        sc_df.style.background_gradient(subset=["Score"], cmap="RdYlGn", vmin=0, vmax=100),
+        hide_index=True, use_container_width=True,
+    )
+
+    if len(rows) >= 2:
+        winner = sc_df.iloc[0]
+        loser  = sc_df.iloc[-1]
+        st.success(
+            f"**Strongest economy (composite):** {winner['Country']} — "
+            f"Score {winner['Score']}/100, Grade {winner['Grade']}"
+        )
+        st.warning(
+            f"**Most room for improvement:** {loser['Country']} — "
+            f"Score {loser['Score']}/100, Grade {loser['Grade']}"
+        )
+
+    # Bar chart of composite scores
+    fig, ax = plt.subplots(figsize=(9, max(3, len(sc_df) * 0.5)))
+    fig.patch.set_facecolor("white")
+    ax.set_facecolor("#fafafa")
+    colors = ["#2ecc71" if s >= 65 else "#f39c12" if s >= 40 else "#e74c3c"
+              for s in sc_df["Score"]]
+    ax.barh(sc_df["Country"][::-1], sc_df["Score"][::-1], color=colors[::-1], alpha=0.85)
+    ax.set_xlabel("Composite Score (0–100)")
+    ax.set_title("Economy Scorecard", fontsize=11, fontweight="bold")
+    ax.axvline(50, color="#aaa", lw=0.8, ls="--")
+    ax.set_xlim(0, 100)
+    for i, (_, row) in enumerate(sc_df[::-1].iterrows()):
+        ax.text(row["Score"] + 1, i, f"{row['Score']}  {row['Grade']}",
+                va="center", fontsize=8)
+    fig.tight_layout()
+    st.pyplot(fig, use_container_width=True)
+    plt.close(fig)
+    st.caption(
+        "Scores normalized within selected group. "
+        "Inflation & Unemployment: lower actual = higher score. "
+        "GDP Growth & GDP per Capita: higher actual = higher score."
+    )
+
+
 # ── Sidebar ───────────────────────────────────────────────────────────────────
 with st.sidebar:
     st.title("📊 Economic\nData Explorer")
@@ -817,8 +1068,9 @@ if mode == "🇺🇸 US Economy":
     st.divider()
 
     # ── Tabs ──────────────────────────────────────────────────────────────────
-    tab_charts, tab_table, tab_corr, tab_summary = st.tabs(
-        ["📈 Charts", "📊 Data Table", "🔗 Correlations", "📋 Summary"])
+    tab_charts, tab_table, tab_corr, tab_forecast, tab_compare, tab_summary = st.tabs(
+        ["📈 Charts", "📊 Data Table", "🔗 Correlations",
+         "🔮 Forecast", "⏳ Period Compare", "📋 Summary"])
 
     with tab_charts:
         if chart_layout == "Grid (one each)":
@@ -895,6 +1147,48 @@ if mode == "🇺🇸 US Economy":
                     st.dataframe(corr_matrix.style.background_gradient(
                         cmap="RdYlGn", vmin=-1, vmax=1), use_container_width=True)
 
+    with tab_forecast:
+        st.markdown("### 5-Year Forecast")
+        st.caption(
+            "Linear trend projected forward 60 months with a 95% confidence interval. "
+            "The moving average smooths short-term noise. "
+            "**This is a statistical extrapolation, not a prediction** — it assumes the trend continues unchanged."
+        )
+        if not selected_indicators:
+            st.info("Select indicators in the sidebar.")
+        else:
+            fc_ind = st.selectbox("Indicator to forecast", selected_indicators, key="fc_ind")
+            col_data = df[fc_ind].dropna()
+            fig, info = chart_forecast(col_data, fc_ind)
+            if fig and info:
+                st.pyplot(fig, use_container_width=True)
+                plt.close(fig)
+
+                # Callout sentence
+                direction_word = "reach" if info["direction"] == "rise" else "fall to"
+                st.info(
+                    f"**Projection:** If the current trend continues, **{fc_ind.split('(')[0].strip()}** "
+                    f"will {direction_word} approximately **{info['forecast_val']:.2f}{info['unit']}** "
+                    f"by **{info['target_year']}** "
+                    f"(95% CI: {info['forecast_val'] - info['ci_end']:.2f} – "
+                    f"{info['forecast_val'] + info['ci_end']:.2f}{info['unit']}). "
+                    f"Annual trend: **{info['annual_change']:+.2f}{info['unit']}/year**. "
+                    f"Model fit: R² = {info['r_squared']:.3f}."
+                )
+
+                # Warn if poor fit
+                if info["r_squared"] < 0.3:
+                    st.warning(
+                        f"R² = {info['r_squared']:.3f} — low model fit. "
+                        "This indicator doesn't follow a strong linear trend, so the projection "
+                        "is highly uncertain. Treat with caution."
+                    )
+            else:
+                st.info("Need at least 24 months of data to forecast.")
+
+    with tab_compare:
+        render_period_comparison(df, selected_indicators)
+
     with tab_summary:
         render_us_summary(df, selected_indicators, s, e)
 
@@ -942,8 +1236,9 @@ else:
     st.divider()
 
     # ── Tabs ──────────────────────────────────────────────────────────────────
-    tab_line, tab_bar, tab_table, tab_summary = st.tabs(
-        ["📈 Trend Chart", "📊 Country Comparison Bar", "🗂️ Data Table", "📋 Summary"])
+    tab_line, tab_bar, tab_table, tab_scorecard, tab_summary = st.tabs(
+        ["📈 Trend Chart", "📊 Country Comparison Bar", "🗂️ Data Table",
+         "🏆 Scorecard", "📋 Summary"])
 
     with tab_line:
         fig = chart_global(wb_df, global_indicator, chart_type, s, e)
@@ -979,6 +1274,18 @@ else:
             file_name=f"global_{global_indicator.replace(' ', '_')}_{s}_{e}.csv",
             mime="text/csv",
         )
+
+    with tab_scorecard:
+        st.markdown("### Economy Scorecard")
+        st.caption(
+            "Ranks all selected countries across ALL four indicators simultaneously. "
+            "Fetches additional data if not already loaded — may take a few seconds."
+        )
+        sc_year = st.slider("Reference year for scorecard", min_value=s, max_value=e,
+                            value=min(e, 2023), key="sc_year")
+        with st.spinner("Loading all indicators for scorecard..."):
+            all_wb = fetch_all_wb(country_codes)
+        render_scorecard(all_wb, selected_countries, sc_year)
 
     with tab_summary:
         render_global_summary(wb_df, global_indicator, s, e, selected_countries)
