@@ -1236,8 +1236,9 @@ else:
     st.divider()
 
     # ── Tabs ──────────────────────────────────────────────────────────────────
-    tab_line, tab_bar, tab_table, tab_scorecard, tab_summary = st.tabs(
-        ["📈 Trend Chart", "📊 Country Comparison Bar", "🗂️ Data Table",
+    tab_line, tab_bar, tab_table, tab_corr_g, tab_forecast_g, tab_compare_g, tab_scorecard, tab_summary = st.tabs(
+        ["📈 Trend Chart", "📊 Country Bar", "🗂️ Data Table",
+         "🔗 Correlations", "🔮 Forecast", "⏳ Period Compare",
          "🏆 Scorecard", "📋 Summary"])
 
     with tab_line:
@@ -1274,6 +1275,193 @@ else:
             file_name=f"global_{global_indicator.replace(' ', '_')}_{s}_{e}.csv",
             mime="text/csv",
         )
+
+    with tab_corr_g:
+        st.markdown("### Correlation Between Countries")
+        st.caption(
+            "How closely do two countries' values move together over time? "
+            "r = +1 means they move in lockstep. r = -1 means they move opposite."
+        )
+        sub_wb = wb_df.loc[s:e].dropna(how="all")
+        avail_countries = [c for c in selected_countries if c in sub_wb.columns]
+        if len(avail_countries) < 2:
+            st.info("Select at least 2 countries in the sidebar.")
+        else:
+            gc1, gc2 = st.columns(2)
+            cx = gc1.selectbox("Country X", avail_countries, index=0, key="gcx")
+            cy = gc2.selectbox("Country Y", avail_countries,
+                               index=min(1, len(avail_countries)-1), key="gcy")
+            if cx == cy:
+                st.warning("Pick two different countries.")
+            else:
+                paired = sub_wb[[cx, cy]].dropna()
+                if len(paired) < 5:
+                    st.warning("Not enough overlapping years to compute correlation.")
+                else:
+                    sl, ic, r, p, _ = stats.linregress(paired[cx], paired[cy])
+                    fig, ax = plt.subplots(figsize=(8, 6))
+                    fig.patch.set_facecolor("white")
+                    ax.set_facecolor("#fafafa")
+                    sc = ax.scatter(paired[cx], paired[cy],
+                                   c=paired.index, cmap="plasma", s=60, zorder=3, alpha=0.8)
+                    plt.colorbar(sc, ax=ax, label="Year")
+                    xr = np.linspace(paired[cx].min(), paired[cx].max(), 100)
+                    ax.plot(xr, sl * xr + ic, color="black", lw=2,
+                            label=f"r = {r:.3f},  p = {p:.4f}")
+                    ax.set_xlabel(f"{cx}  —  {global_indicator}")
+                    ax.set_ylabel(f"{cy}  —  {global_indicator}")
+                    ax.set_title(f"Correlation: {cx} vs {cy}", fontsize=11, fontweight="bold")
+                    ax.legend(fontsize=9); ax.grid(alpha=0.25, ls="--")
+                    fig.tight_layout()
+                    st.pyplot(fig, use_container_width=True); plt.close(fig)
+
+                    interp = (
+                        "Strong positive — both countries' values rise and fall together."
+                        if r > 0.6 else
+                        "Moderate positive — broadly correlated but with divergences."
+                        if r > 0.3 else
+                        "Weak / no relationship — the two countries move independently."
+                        if abs(r) <= 0.3 else
+                        "Moderate inverse — when one rises, the other tends to fall."
+                        if r > -0.6 else
+                        "Strong inverse — the countries move in opposite directions."
+                    )
+                    box = st.success if r > 0.3 else st.info if abs(r) <= 0.3 else st.warning
+                    box(f"**r = {r:.3f}** · p = {p:.4f} · N = {len(paired)} years\n\n{interp}")
+
+                    # Full matrix
+                    if len(avail_countries) >= 3:
+                        st.markdown("#### Full Correlation Matrix")
+                        mat = sub_wb[avail_countries].corr().round(3)
+                        st.dataframe(
+                            mat.style.background_gradient(cmap="RdYlGn", vmin=-1, vmax=1),
+                            use_container_width=True)
+
+    with tab_forecast_g:
+        st.markdown("### 5-Year Country Forecast")
+        st.caption(
+            "Linear trend projected 5 years ahead for each country. "
+            "Annual data is interpolated to monthly for smoother curves. "
+            "**Statistical extrapolation only — not a prediction.**"
+        )
+        sub_wb = wb_df.loc[s:e]
+        avail_countries = [c for c in selected_countries if c in sub_wb.columns]
+        fc_country = st.selectbox("Country to forecast", avail_countries, key="fc_country")
+
+        col_raw = sub_wb[fc_country].dropna()
+        if len(col_raw) < 5:
+            st.warning("Need at least 5 years of data to project.")
+        else:
+            # Interpolate annual → monthly for smoother plot
+            col_m = col_raw.resample("MS").interpolate("linear")
+
+            # Fit on annual data for stability
+            x_a = np.arange(len(col_raw))
+            sl, ic, r, p, _ = stats.linregress(x_a, col_raw.values)
+            rmse   = np.sqrt(np.mean((col_raw.values - (sl * x_a + ic))**2))
+            x_mean = x_a.mean(); ss_x = np.sum((x_a - x_mean)**2)
+
+            # Project 5 years ahead (annual)
+            n_fwd  = 5
+            fx_a   = np.arange(len(col_raw), len(col_raw) + n_fwd)
+            fdates = pd.date_range(
+                str(col_raw.index[-1] + 1), periods=n_fwd, freq="YS")
+            fvals  = sl * fx_a + ic
+            ci     = 1.96 * rmse * np.sqrt(
+                1 + 1/len(col_raw) + (fx_a - x_mean)**2 / ss_x)
+
+            ma = col_m.rolling(24).mean()
+
+            fig, ax = plt.subplots(figsize=(12, 5))
+            fig.patch.set_facecolor("white"); ax.set_facecolor("#fafafa")
+            ax.plot(col_m.index, col_m,  color="#1f77b4", lw=1.4, alpha=0.5, label="Actual")
+            ax.plot(ma.index,    ma,      color="#1f77b4", lw=2.2, label="24-month Moving Avg")
+            ax.plot(col_raw.index, sl * x_a + ic,
+                    color="black", lw=0.9, ls="--", alpha=0.4, label="Historical trend")
+            ax.plot(fdates, fvals, color="black", lw=2, ls="--", label="Forecast")
+            ax.fill_between(fdates, fvals - ci, fvals + ci,
+                            color="gray", alpha=0.2, label="95% CI")
+            ax.axvline(col_raw.index[-1], color="#aaa", lw=1, ls=":")
+            ax.set_title(f"{fc_country}  —  {global_indicator}  (5-Year Forecast)",
+                         fontsize=11, fontweight="bold")
+            ax.set_ylabel(global_indicator); ax.legend(fontsize=8)
+            ax.grid(axis="y", alpha=0.3, ls="--"); fig.tight_layout()
+            st.pyplot(fig, use_container_width=True); plt.close(fig)
+
+            dword = "reach" if sl > 0 else "fall to"
+            st.info(
+                f"**Projection for {fc_country}:** If the current trend continues, "
+                f"**{global_indicator}** will {dword} approximately "
+                f"**{fvals[-1]:.2f}** by **{fdates[-1].year}** "
+                f"(95% CI: {fvals[-1]-ci[-1]:.2f} – {fvals[-1]+ci[-1]:.2f}). "
+                f"Annual change: **{sl:+.2f}/year**. Model fit: R² = {r**2:.3f}."
+            )
+            if r**2 < 0.3:
+                st.warning(
+                    f"R² = {r**2:.3f} — low fit. "
+                    "The data doesn't follow a strong linear trend; wide uncertainty.")
+
+    with tab_compare_g:
+        st.markdown("### Period vs Period Comparison")
+        st.caption("Compare the same indicator across all countries in two different time windows.")
+        sub_wb = wb_df.dropna(how="all")
+        avail_yrs = sorted(sub_wb.index.tolist())
+        if len(avail_yrs) < 4:
+            st.warning("Not enough years of data for period comparison.")
+        else:
+            mid = avail_yrs[len(avail_yrs) // 2]
+            pc1, pc2 = st.columns(2)
+            with pc1:
+                st.markdown("**Period A**")
+                gpa_s = st.selectbox("Start", avail_yrs, index=0, key="gpa_s")
+                gpa_e = st.selectbox("End",   avail_yrs,
+                                     index=len(avail_yrs)//2 - 1, key="gpa_e")
+            with pc2:
+                st.markdown("**Period B**")
+                gpb_s = st.selectbox("Start", avail_yrs,
+                                     index=len(avail_yrs)//2, key="gpb_s")
+                gpb_e = st.selectbox("End",   avail_yrs,
+                                     index=len(avail_yrs)-1, key="gpb_e")
+
+            lower_better = "Inflation" in global_indicator or "Unemployment" in global_indicator
+            df_a = sub_wb.loc[gpa_s:gpa_e]
+            df_b = sub_wb.loc[gpb_s:gpb_e]
+
+            rows = []
+            avail_c = [c for c in selected_countries if c in sub_wb.columns]
+            for country in avail_c:
+                a_mean = df_a[country].dropna().mean() if country in df_a else np.nan
+                b_mean = df_b[country].dropna().mean() if country in df_b else np.nan
+                if np.isnan(a_mean) or np.isnan(b_mean):
+                    continue
+                change = b_mean - a_mean
+                improved = (change < 0) if lower_better else (change > 0)
+                better   = "B" if improved else "A"
+                rows.append({
+                    "Country":                    country,
+                    f"Period A ({gpa_s}–{gpa_e})": round(a_mean, 2),
+                    f"Period B ({gpb_s}–{gpb_e})": round(b_mean, 2),
+                    "Change":                     f"{change:+.2f}",
+                    "Better Period":              f"Period {better}",
+                    "Improved?":                  "✅" if improved else "❌",
+                })
+
+            if rows:
+                cdf = pd.DataFrame(rows)
+                st.dataframe(cdf, hide_index=True, use_container_width=True)
+                improved_n  = sum(1 for r in rows if r["Improved?"] == "✅")
+                worsened_n  = len(rows) - improved_n
+                st.markdown("**Findings:**")
+                st.markdown(
+                    f"- **{improved_n}** of {len(rows)} countries **improved** "
+                    f"from Period A to Period B")
+                st.markdown(
+                    f"- **{worsened_n}** countries **worsened** or stayed the same")
+                top = min(rows, key=lambda r: float(r["Change"].replace("+","")) if lower_better
+                          else -float(r["Change"].replace("+","")))
+                st.success(f"**Biggest improver:** {top['Country']} (change: {top['Change']})")
+            else:
+                st.info("No overlapping data for both periods.")
 
     with tab_scorecard:
         st.markdown("### Economy Scorecard")
